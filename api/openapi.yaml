@@ -1,0 +1,3138 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Fabien Dupont <fdupont@redhat.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# Clean facade API for NVIDIA UFM Enterprise.
+# This spec defines the API we wish UFM had — consistent REST semantics,
+# standard error envelope, cursor-based pagination, and proper resource modeling.
+#
+# A translation proxy (ufm-api) maps these clean endpoints to UFM's actual
+# REST API (/ufmRest/*, /ufmRestV2/*, /ufmRestV3/*).
+#
+# UFM REST API reference: https://docs.nvidia.com/networking/display/ufmenterpriserestapiv6242
+# Target UFM version: 6.24.2
+
+openapi: "3.0.3"
+info:
+  title: UFM Facade API
+  description: |
+    A clean, consistent REST facade for NVIDIA Unified Fabric Manager (UFM) Enterprise.
+
+    This API proxies to a UFM Enterprise instance, normalizing its heterogeneous
+    endpoint patterns into standard RESTful resources with consistent naming,
+    pagination, error handling, and authentication.
+
+    ## Design principles
+
+    - **Resource-oriented**: every endpoint operates on a noun (`/partitions`, `/systems`, `/ports`)
+    - **Consistent verbs**: `GET` (read), `POST` (create), `PUT` (replace), `PATCH` (update), `DELETE` (remove)
+    - **Standard error envelope**: all errors return `{"error": {"code": "...", "message": "...", "details": [...]}}`
+    - **Cursor-based pagination**: list endpoints support `?cursor=&limit=`
+    - **Single auth scheme**: Bearer token or HTTP Basic, no path-based auth switching
+
+    ## UFM compatibility
+
+    Each operation documents the upstream UFM endpoint it maps to via the
+    `x-ufm-upstream` extension. This allows maintainers to trace clean
+    operations back to UFM's actual API surface.
+  version: 0.1.0
+  contact:
+    name: NCP Red Hat Stack
+  license:
+    name: Apache-2.0
+
+servers:
+  - url: /api/v1
+    description: Facade API (all endpoints relative to this base)
+
+security:
+  - bearerAuth: []
+  - basicAuth: []
+
+tags:
+  - name: partitions
+    description: |
+      InfiniBand partition (PKEY) lifecycle management.
+      Maps to UFM's `/ufmRest/resources/pkeys` endpoints.
+  - name: partition-members
+    description: |
+      GUID and host membership within partitions.
+      Maps to UFM's PKEY GUID/host add/remove endpoints.
+  - name: systems
+    description: |
+      Fabric systems (switches, hosts, gateways, routers).
+      Maps to UFM's `/ufmRest/resources/systems` endpoints.
+  - name: ports
+    description: |
+      Physical and virtual port inventory and status.
+      Maps to UFM's `/ufmRest/resources/ports` and `/ufmRest/resources/vports`.
+  - name: jobs
+    description: |
+      Asynchronous job tracking for long-running operations.
+      Maps to UFM's `/ufmRest/jobs` endpoints.
+  - name: monitoring
+    description: |
+      Performance monitoring sessions, snapshots, and templates.
+      Maps to UFM's `/ufmRest/monitoring` endpoints.
+  - name: telemetry
+    description: |
+      Real-time and historical telemetry data.
+      Maps to UFM's `/ufmRest/telemetry` endpoints.
+  - name: topology
+    description: |
+      Logical model — environments, logical servers, computes, networks.
+      Maps to UFM's `/ufmRest/resources/environments` and nested resources.
+  - name: actions
+    description: |
+      Infrastructure actions — reboot, firmware upgrade, port operations.
+      Splits UFM's monolithic `POST /ufmRest/actions` into proper sub-resources.
+  - name: mirroring
+    description: |
+      Port mirroring configuration and control.
+      Maps to UFM's `/ufmRest/app/mirrorings` endpoints.
+  - name: templates
+    description: |
+      Provisioning templates for switch configuration.
+      Maps to UFM's `/ufmRest/templates` endpoints.
+  - name: fabric-health
+    description: |
+      Fabric validation tests and health reports.
+      Maps to UFM's `/ufmRest/fabricValidation` and `/ufmRest/reports`.
+  - name: config
+    description: |
+      UFM server configuration and version information.
+      Maps to UFM's `/ufmRest/app/ufm_config` and `/ufmRest/app/ufm_version`.
+  - name: discovery
+    description: |
+      Fabric discovery and inventory refresh.
+      Maps to UFM's `/ufmRest/monitoring/inventory` and `/ufmRest/actions/fabric_discovery_refresh`.
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+paths:
+  # =========================================================================
+  # Partitions (PKEYs)
+  # =========================================================================
+
+  /partitions:
+    get:
+      operationId: listPartitions
+      summary: List all partitions
+      tags: [partitions]
+      x-ufm-upstream: GET /ufmRest/resources/pkeys
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+        - name: include
+          in: query
+          description: |
+            Comma-separated list of additional data to include.
+            Supported values: `members`, `qos`, `port_info`, `sharp_state`.
+          schema:
+            type: string
+            example: "members,qos"
+      responses:
+        "200":
+          description: Paginated list of partitions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PartitionList"
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: createPartition
+      summary: Create a partition
+      description: |
+        Creates a new InfiniBand partition (PKEY). Optionally include initial
+        GUID members in the request body.
+
+        Upstream, this maps to either `POST /ufmRest/resources/pkeys/add`
+        (empty partition) or `POST /ufmRest/resources/pkeys/` (with GUIDs),
+        depending on whether `members` is provided.
+      tags: [partitions]
+      x-ufm-upstream: POST /ufmRest/resources/pkeys/add | POST /ufmRest/resources/pkeys/
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PartitionCreate"
+      responses:
+        "201":
+          description: Partition created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Partition"
+        "409":
+          description: Partition with this PKEY already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /partitions/{pkey}:
+    parameters:
+      - $ref: "#/components/parameters/pkey"
+
+    get:
+      operationId: getPartition
+      summary: Get a partition
+      tags: [partitions]
+      x-ufm-upstream: GET /ufmRest/resources/pkeys/{pkey}
+      parameters:
+        - name: include
+          in: query
+          schema:
+            type: string
+            example: "members,qos"
+      responses:
+        "200":
+          description: Partition details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Partition"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+    put:
+      operationId: replacePartition
+      summary: Replace a partition's configuration
+      description: |
+        Replaces the full GUID membership and QoS settings of a partition.
+        All existing members not in the new list are removed.
+      tags: [partitions]
+      x-ufm-upstream: PUT /ufmRest/resources/pkeys/
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PartitionReplace"
+      responses:
+        "200":
+          description: Partition replaced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Partition"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deletePartition
+      summary: Delete a partition
+      tags: [partitions]
+      x-ufm-upstream: DELETE /ufmRest/resources/pkeys/{pkey}
+      responses:
+        "204":
+          description: Partition deleted.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /partitions/{pkey}/qos:
+    parameters:
+      - $ref: "#/components/parameters/pkey"
+
+    put:
+      operationId: updatePartitionQoS
+      summary: Update partition QoS settings
+      description: |
+        Updates MTU limit, service level, and rate limit for a partition.
+        Note: UFM requires a restart for QoS changes to take effect.
+      tags: [partitions]
+      x-ufm-upstream: PUT /ufmRest/resources/pkeys/qos_conf
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PartitionQoS"
+      responses:
+        "200":
+          description: QoS updated. UFM restart required for changes to take effect.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PartitionQoS"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /partitions/{pkey}/sharp:
+    parameters:
+      - $ref: "#/components/parameters/pkey"
+
+    put:
+      operationId: updatePartitionSHARP
+      summary: Enable or disable SHARP reservation
+      tags: [partitions]
+      x-ufm-upstream: PUT /ufmRest/resources/pkeys/{pkey}/sharp-reservation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+                  description: Enable or disable SHARP reservation for this partition.
+      responses:
+        "200":
+          description: SHARP reservation updated.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /partitions/{pkey}/last-updated:
+    parameters:
+      - $ref: "#/components/parameters/pkey"
+
+    get:
+      operationId: getPartitionLastUpdated
+      summary: Get partition last-updated timestamp
+      tags: [partitions]
+      x-ufm-upstream: GET /ufmRest/resources/pkeys/last_updated
+      responses:
+        "200":
+          description: Last-updated timestamp.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  last_updated:
+                    type: string
+                    format: date-time
+                    nullable: true
+                    description: |
+                      ISO 8601 timestamp of last modification.
+                      Null if never modified since UFM restart.
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Partition Members (GUIDs and Hosts)
+  # =========================================================================
+
+  /partitions/{pkey}/members:
+    parameters:
+      - $ref: "#/components/parameters/pkey"
+
+    get:
+      operationId: listPartitionMembers
+      summary: List GUID members of a partition
+      tags: [partition-members]
+      x-ufm-upstream: GET /ufmRest/resources/pkeys/{pkey}?guids_data=true
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: Paginated list of GUID members.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PartitionMemberList"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: addPartitionMembers
+      summary: Add GUIDs to a partition
+      tags: [partition-members]
+      x-ufm-upstream: POST /ufmRest/resources/pkeys/
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PartitionMembersAdd"
+      responses:
+        "200":
+          description: Members added.
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: removePartitionMembers
+      summary: Remove GUIDs from a partition
+      description: |
+        Removes one or more GUIDs from a partition. Pass GUIDs in the
+        request body as an array.
+
+        Upstream, this translates to
+        `DELETE /ufmRest/resources/pkeys/{pkey}/guids/{guid1},{guid2}`
+        with comma-separated GUIDs in the path.
+      tags: [partition-members]
+      x-ufm-upstream: DELETE /ufmRest/resources/pkeys/{pkey}/guids/{guids}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [guids]
+              properties:
+                guids:
+                  type: array
+                  items:
+                    type: string
+                  description: GUIDs to remove.
+                  example: ["98039b0300860ace", "98039b0300860acf"]
+      responses:
+        "200":
+          description: Members removed.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /partitions/{pkey}/hosts:
+    parameters:
+      - $ref: "#/components/parameters/pkey"
+
+    post:
+      operationId: addPartitionHosts
+      summary: Add hosts to a partition
+      description: |
+        Adds all ports of the named hosts to the partition.
+        Returns a job for tracking the async operation.
+      tags: [partition-members]
+      x-ufm-upstream: POST /ufmRest/resources/pkeys/hosts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PartitionHostsAdd"
+      responses:
+        "202":
+          description: Host addition accepted. Returns job for tracking.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: removePartitionHosts
+      summary: Remove hosts from a partition
+      description: |
+        Upstream maps to
+        `DELETE /ufmRest/resources/pkeys/{pkey}/hosts/{host1},{host2}`.
+      tags: [partition-members]
+      x-ufm-upstream: DELETE /ufmRest/resources/pkeys/{pkey}/hosts/{hosts}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hosts]
+              properties:
+                hosts:
+                  type: array
+                  items:
+                    type: string
+                  description: Hostnames to remove.
+      responses:
+        "200":
+          description: Hosts removed.
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Systems
+  # =========================================================================
+
+  /systems:
+    get:
+      operationId: listSystems
+      summary: List all fabric systems
+      tags: [systems]
+      x-ufm-upstream: GET /ufmRest/resources/systems
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+        - name: type
+          in: query
+          description: Filter by system type.
+          schema:
+            type: string
+            enum: [switch, host, gateway, router]
+        - name: model
+          in: query
+          description: Filter by switch model.
+          schema:
+            type: string
+        - name: role
+          in: query
+          description: Filter by topology role.
+          schema:
+            type: string
+            enum: [core, tor, endpoint]
+        - name: ip
+          in: query
+          description: Filter by system IP address.
+          schema:
+            type: string
+            format: ipv4
+        - name: rack
+          in: query
+          description: Filter by rack membership.
+          schema:
+            type: string
+        - name: compute_status
+          in: query
+          description: Filter by compute allocation status.
+          schema:
+            type: string
+            enum: [allocated, free]
+        - name: include
+          in: query
+          description: |
+            Comma-separated additional data: `ports`, `chassis`, `brief`.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated list of systems.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SystemList"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /systems/{system_id}:
+    parameters:
+      - name: system_id
+        in: path
+        required: true
+        description: System name or GUID.
+        schema:
+          type: string
+
+    get:
+      operationId: getSystem
+      summary: Get a system
+      tags: [systems]
+      x-ufm-upstream: GET /ufmRest/resources/systems/{system_id}
+      parameters:
+        - name: include
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: System details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/System"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+    patch:
+      operationId: updateSystem
+      summary: Update system properties
+      description: Set manual IP, name, URL, or script attributes.
+      tags: [systems]
+      x-ufm-upstream: PUT /ufmRest/resources/systems/{system_id} | PUT /ufmRest/resources/systems/{system_id}/properties
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SystemUpdate"
+      responses:
+        "200":
+          description: System updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/System"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /systems/{system_id}/reboot:
+    parameters:
+      - name: system_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: rebootSystem
+      summary: Reboot a system
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/actions (action=reboot)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                in_band:
+                  type: boolean
+                  default: false
+                  description: Use in-band reboot for unmanaged switches.
+      responses:
+        "202":
+          description: Reboot initiated. Returns job for tracking.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /systems/{system_id}/firmware:
+    parameters:
+      - name: system_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: upgradeSystemFirmware
+      summary: Upgrade system firmware
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/actions (action=firmware_upgrade)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                image:
+                  type: string
+                  description: Firmware image name.
+                in_band:
+                  type: boolean
+                  default: false
+      responses:
+        "202":
+          description: Firmware upgrade initiated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /systems/{system_id}/software:
+    parameters:
+      - name: system_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: upgradeSystemSoftware
+      summary: Upgrade system software
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/actions (action=software_upgrade)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                image:
+                  type: string
+                  description: Software image name.
+      responses:
+        "202":
+          description: Software upgrade initiated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /systems/{system_id}/dump:
+    parameters:
+      - name: system_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: collectSystemDump
+      summary: Collect system dump
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/actions (action=system_dump)
+      responses:
+        "202":
+          description: Dump collection initiated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /systems/{system_id}/health:
+    parameters:
+      - name: system_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    put:
+      operationId: setSystemHealth
+      summary: Mark system healthy or unhealthy
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/actions (action=mark_unhealthy) | POST /ufmRestV2/actions (action=restore_healthy)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [healthy]
+              properties:
+                healthy:
+                  type: boolean
+                isolation_policy:
+                  type: string
+                  description: Isolation policy when marking unhealthy.
+      responses:
+        "200":
+          description: Health status updated.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /systems/power:
+    get:
+      operationId: listSystemsPower
+      summary: Get power consumption for all managed switches
+      tags: [systems]
+      x-ufm-upstream: GET /ufmRest/resources/systems/power?csv_format=true
+      responses:
+        "200":
+          description: Power consumption data.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SystemPower"
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Ports
+  # =========================================================================
+
+  /ports:
+    get:
+      operationId: listPorts
+      summary: List fabric ports
+      tags: [ports]
+      x-ufm-upstream: GET /ufmRest/resources/ports
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+        - name: system
+          in: query
+          description: Filter by system name.
+          schema:
+            type: string
+        - name: system_type
+          in: query
+          description: Filter by system type (e.g. Switch).
+          schema:
+            type: string
+        - name: active
+          in: query
+          description: Only return active ports.
+          schema:
+            type: boolean
+        - name: external
+          in: query
+          description: Only return external ports.
+          schema:
+            type: boolean
+        - name: high_ber
+          in: query
+          description: Only return high BER ports.
+          schema:
+            type: boolean
+        - name: high_ber_severity
+          in: query
+          description: Filter high BER ports by severity.
+          schema:
+            type: string
+            enum: [warning, error]
+        - name: include
+          in: query
+          description: "Additional data: `cable_info`."
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated list of ports.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortList"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /ports/{port_name}:
+    parameters:
+      - name: port_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getPort
+      summary: Get a port
+      tags: [ports]
+      x-ufm-upstream: GET /ufmRest/resources/ports/{port_name}
+      responses:
+        "200":
+          description: Port details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Port"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /ports/{port_name}/enable:
+    parameters:
+      - name: port_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: enablePort
+      summary: Enable a port
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/actions (action=port_enable)
+      responses:
+        "200":
+          description: Port enabled.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /ports/{port_name}/disable:
+    parameters:
+      - name: port_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: disablePort
+      summary: Disable a port
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/actions (action=port_disable)
+      responses:
+        "200":
+          description: Port disabled.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /ports/{port_name}/reset:
+    parameters:
+      - name: port_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: resetPort
+      summary: Reset a port
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/actions (action=port_reset)
+      responses:
+        "200":
+          description: Port reset.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /virtual-ports:
+    get:
+      operationId: listVirtualPorts
+      summary: List all virtual ports
+      tags: [ports]
+      x-ufm-upstream: GET /ufmRest/resources/vports
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+        - name: system
+          in: query
+          description: Filter by system GUID.
+          schema:
+            type: string
+        - name: port
+          in: query
+          description: Filter by physical port name.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated list of virtual ports.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VirtualPortList"
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Links
+  # =========================================================================
+
+  /links:
+    get:
+      operationId: listLinks
+      summary: List fabric links
+      tags: [ports]
+      x-ufm-upstream: GET /ufmRest/resources/links
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: Paginated list of links.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LinkList"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /links/dump:
+    post:
+      operationId: collectLinkDump
+      summary: Collect system dump from link endpoints
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/resources/links/collect_system_dump
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [link_ids]
+              properties:
+                link_ids:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "202":
+          description: Dump collection initiated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Jobs
+  # =========================================================================
+
+  /jobs:
+    get:
+      operationId: listJobs
+      summary: List jobs
+      tags: [jobs]
+      x-ufm-upstream: GET /ufmRest/jobs
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+        - name: status
+          in: query
+          description: Filter by job status.
+          schema:
+            type: string
+            enum: [running, completed, failed, aborted]
+        - name: operation
+          in: query
+          description: Filter by operation type.
+          schema:
+            type: string
+        - name: parent_only
+          in: query
+          description: Only return parent jobs (exclude sub-jobs).
+          schema:
+            type: boolean
+        - name: system_ids
+          in: query
+          description: Filter by associated system IDs (comma-separated).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated list of jobs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobList"
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: abortAllJobs
+      summary: Abort all active jobs
+      tags: [jobs]
+      x-ufm-upstream: POST /ufmRest/jobs/abortall
+      responses:
+        "200":
+          description: All active jobs aborted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /jobs/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getJob
+      summary: Get a job
+      tags: [jobs]
+      x-ufm-upstream: GET /ufmRest/jobs/{job_id}
+      parameters:
+        - name: include
+          in: query
+          description: "Additional data: `sub_jobs`, `full`."
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+          headers:
+            Retry-After:
+              description: Seconds to wait before polling again (when job is still running).
+              schema:
+                type: integer
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteJob
+      summary: Delete a job record
+      tags: [jobs]
+      x-ufm-upstream: DELETE /ufmRest/jobs/{job_id}
+      responses:
+        "204":
+          description: Job record deleted.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /jobs/{job_id}/abort:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: abortJob
+      summary: Abort a running job
+      tags: [jobs]
+      x-ufm-upstream: PUT /ufmrest/jobs/status=Aborted
+      responses:
+        "200":
+          description: Job aborted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Monitoring
+  # =========================================================================
+
+  /monitoring/sessions:
+    post:
+      operationId: createMonitoringSession
+      summary: Create and start a monitoring session
+      tags: [monitoring]
+      x-ufm-upstream: POST /ufmRest/monitoring/start
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MonitoringSessionCreate"
+      responses:
+        "201":
+          description: Session created and started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitoringSession"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/sessions/{session_id}:
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getMonitoringSession
+      summary: Get monitoring session configuration
+      tags: [monitoring]
+      x-ufm-upstream: GET /ufmRest/monitoring/session/{session_id}
+      responses:
+        "200":
+          description: Session details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitoringSession"
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteMonitoringSession
+      summary: Stop and remove a monitoring session
+      tags: [monitoring]
+      x-ufm-upstream: DELETE /ufmRest/monitoring/session/{session_id}
+      responses:
+        "204":
+          description: Session deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/sessions/{session_id}/data:
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getMonitoringSessionData
+      summary: Get monitoring session metrics
+      tags: [monitoring]
+      x-ufm-upstream: GET /ufmRest/monitoring/session/{session_id}/data
+      parameters:
+        - name: partition
+          in: query
+          description: Filter by PKEY.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session metrics data.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/snapshots:
+    post:
+      operationId: createMonitoringSnapshot
+      summary: Create a one-time monitoring snapshot
+      tags: [monitoring]
+      x-ufm-upstream: POST /ufmRest/monitoring/snapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MonitoringSnapshotCreate"
+      responses:
+        "200":
+          description: Snapshot data returned inline.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/attributes:
+    get:
+      operationId: listMonitoringAttributes
+      summary: List available counters, classes, and functions
+      tags: [monitoring]
+      x-ufm-upstream: GET /ufmRest/monitoring/attributes
+      responses:
+        "200":
+          description: Available monitoring attributes.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/templates:
+    get:
+      operationId: listMonitoringTemplates
+      summary: List monitoring templates
+      tags: [monitoring]
+      x-ufm-upstream: GET /ufmRest/app/monitoring
+      responses:
+        "200":
+          description: List of monitoring templates.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MonitoringTemplate"
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: createMonitoringTemplate
+      summary: Create a monitoring template
+      tags: [monitoring]
+      x-ufm-upstream: POST /ufmRest/app/monitoring
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MonitoringTemplate"
+      responses:
+        "201":
+          description: Template created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitoringTemplate"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/templates/{template_name}:
+    parameters:
+      - name: template_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getMonitoringTemplate
+      summary: Get a monitoring template
+      tags: [monitoring]
+      x-ufm-upstream: GET /ufmRest/app/monitoring/{template_name}
+      responses:
+        "200":
+          description: Template details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MonitoringTemplate"
+        default:
+          $ref: "#/components/responses/Error"
+
+    put:
+      operationId: updateMonitoringTemplate
+      summary: Update a monitoring template
+      tags: [monitoring]
+      x-ufm-upstream: PUT /ufmRest/app/monitoring
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MonitoringTemplate"
+      responses:
+        "200":
+          description: Template updated.
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteMonitoringTemplate
+      summary: Delete a monitoring template
+      tags: [monitoring]
+      x-ufm-upstream: DELETE /ufmRest/app/monitoring/{template_name}
+      responses:
+        "204":
+          description: Template deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/counters:
+    post:
+      operationId: getPerformanceCounters
+      summary: Extract performance counters for specified hosts
+      tags: [monitoring]
+      x-ufm-upstream: POST /ufmRest/monitoring/job/resources/pm_counters
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hostnames]
+              properties:
+                hostnames:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Performance counter data.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/congestion:
+    get:
+      operationId: getCongestionMap
+      summary: Get traffic and congestion information by tier
+      tags: [monitoring]
+      x-ufm-upstream: GET /ufmRest/monitoring/congestion
+      responses:
+        "200":
+          description: Congestion data.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  /monitoring/port-groups:
+    get:
+      operationId: getPortGroupMetrics
+      summary: Get port group traffic and congestion metrics
+      tags: [monitoring]
+      x-ufm-upstream: GET /ufmRest/monitoring/port_groups
+      responses:
+        "200":
+          description: Port group metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Telemetry
+  # =========================================================================
+
+  /telemetry/top:
+    get:
+      operationId: getTopTelemetry
+      summary: Get Top-X telemetry data
+      tags: [telemetry]
+      x-ufm-upstream: GET /ufmRest/telemetry?type=topX
+      parameters:
+        - name: members_type
+          in: query
+          required: true
+          schema:
+            type: string
+            example: Ports
+        - name: pick_by
+          in: query
+          required: true
+          schema:
+            type: string
+            example: PortTXPackets
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 15
+        - name: attributes
+          in: query
+          description: Additional telemetry attributes to include.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Top-X telemetry data.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  /telemetry/history:
+    get:
+      operationId: getHistoryTelemetry
+      summary: Get historical telemetry data
+      tags: [telemetry]
+      x-ufm-upstream: GET /ufmRest/telemetry?type=history
+      parameters:
+        - name: members_type
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: attributes
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: members
+          in: query
+          required: true
+          description: Comma-separated list of member GUIDs.
+          schema:
+            type: string
+        - name: start_time
+          in: query
+          required: true
+          description: "Relative or absolute start time (e.g. `-1h`)."
+          schema:
+            type: string
+        - name: end_time
+          in: query
+          required: true
+          description: "Relative or absolute end time (e.g. `-0min`)."
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Historical telemetry data.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Topology (Logical Model)
+  # =========================================================================
+
+  /environments:
+    get:
+      operationId: listEnvironments
+      summary: List all environments
+      tags: [topology]
+      x-ufm-upstream: GET /ufmRest/resources/environments
+      parameters:
+        - $ref: "#/components/parameters/cursor"
+        - $ref: "#/components/parameters/limit"
+      responses:
+        "200":
+          description: List of environments.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentList"
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: createEnvironment
+      summary: Create an environment
+      tags: [topology]
+      x-ufm-upstream: POST /ufmRest/resources/environments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnvironmentCreate"
+      responses:
+        "201":
+          description: Environment created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Environment"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /environments/{env_name}:
+    parameters:
+      - name: env_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getEnvironment
+      summary: Get an environment
+      tags: [topology]
+      x-ufm-upstream: GET /ufmRest/resources/environments/{name}
+      responses:
+        "200":
+          description: Environment details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Environment"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+
+    put:
+      operationId: updateEnvironment
+      summary: Update an environment
+      tags: [topology]
+      x-ufm-upstream: PUT /ufmRest/resources/environments/{name}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnvironmentCreate"
+      responses:
+        "200":
+          description: Environment updated.
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteEnvironment
+      summary: Delete an environment
+      tags: [topology]
+      x-ufm-upstream: DELETE /ufmRest/resources/environments/{name}
+      responses:
+        "204":
+          description: Environment deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /environments/{env_name}/servers:
+    parameters:
+      - name: env_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: listLogicalServers
+      summary: List logical servers in an environment
+      tags: [topology]
+      x-ufm-upstream: GET /ufmRest/resources/environments/{name}/logical_servers
+      responses:
+        "200":
+          description: List of logical servers.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LogicalServer"
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: createLogicalServer
+      summary: Create a logical server
+      tags: [topology]
+      x-ufm-upstream: POST /ufmRest/resources/environments/{name}/logical_servers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LogicalServerCreate"
+      responses:
+        "201":
+          description: Logical server created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogicalServer"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /environments/{env_name}/servers/{server_name}:
+    parameters:
+      - name: env_name
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: server_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getLogicalServer
+      summary: Get a logical server
+      tags: [topology]
+      x-ufm-upstream: GET /ufmRest/resources/environments/{name}/logical_servers/{name}
+      responses:
+        "200":
+          description: Logical server details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogicalServer"
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteLogicalServer
+      summary: Delete a logical server
+      tags: [topology]
+      x-ufm-upstream: DELETE /ufmRest/resources/environments/{name}/logical_servers/{name}
+      responses:
+        "204":
+          description: Logical server deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /environments/{env_name}/servers/{server_name}/computes:
+    parameters:
+      - name: env_name
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: server_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: listComputes
+      summary: List computes assigned to a logical server
+      tags: [topology]
+      x-ufm-upstream: GET /ufmRest/resources/environments/{name}/logical_servers/{name}/computes
+      responses:
+        "200":
+          description: List of computes.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Compute"
+        default:
+          $ref: "#/components/responses/Error"
+
+    put:
+      operationId: assignComputes
+      summary: Assign computes to a logical server
+      tags: [topology]
+      x-ufm-upstream: PUT /ufmRest/resources/environments/{name}/logical_servers/{name}/allocate-computes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [manual, auto]
+                  default: auto
+                computes:
+                  type: array
+                  items:
+                    type: string
+                  description: Compute names (required for manual mode).
+      responses:
+        "200":
+          description: Computes assigned.
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: freeComputes
+      summary: Deallocate computes from a logical server
+      tags: [topology]
+      x-ufm-upstream: PUT /ufmRest/resources/environments/{name}/logical_servers/{name}/free-computes
+      responses:
+        "200":
+          description: Computes freed.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /environments/{env_name}/networks:
+    parameters:
+      - name: env_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: listLocalNetworks
+      summary: List local networks in an environment
+      tags: [topology]
+      x-ufm-upstream: GET /ufmRest/resources/environments/{name}/networks
+      responses:
+        "200":
+          description: List of local networks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Network"
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: createLocalNetwork
+      summary: Create a local network in an environment
+      tags: [topology]
+      x-ufm-upstream: POST /ufmRest/resources/environments/{name}/networks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkCreate"
+      responses:
+        "201":
+          description: Network created.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /networks:
+    get:
+      operationId: listGlobalNetworks
+      summary: List all global networks
+      tags: [topology]
+      x-ufm-upstream: GET /ufmRest/resources/networks
+      responses:
+        "200":
+          description: List of global networks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Network"
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: createGlobalNetwork
+      summary: Create a global network
+      tags: [topology]
+      x-ufm-upstream: POST /ufmRest/resources/networks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkCreate"
+      responses:
+        "201":
+          description: Network created.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /networks/{network_name}:
+    parameters:
+      - name: network_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getGlobalNetwork
+      summary: Get a global network
+      tags: [topology]
+      x-ufm-upstream: GET /ufmRest/resources/networks/{name}
+      responses:
+        "200":
+          description: Network details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Network"
+        default:
+          $ref: "#/components/responses/Error"
+
+    put:
+      operationId: updateGlobalNetwork
+      summary: Update a global network
+      tags: [topology]
+      x-ufm-upstream: PUT /ufmRest/resources/networks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NetworkCreate"
+      responses:
+        "200":
+          description: Network updated.
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteGlobalNetwork
+      summary: Delete a global network
+      tags: [topology]
+      x-ufm-upstream: DELETE /ufmRest/resources/networks/{name}
+      responses:
+        "204":
+          description: Network deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Mirroring
+  # =========================================================================
+
+  /mirroring:
+    post:
+      operationId: createMirroringTemplate
+      summary: Create a mirroring template
+      tags: [mirroring]
+      x-ufm-upstream: POST /ufmRest/app/mirrorings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MirroringTemplate"
+      responses:
+        "200":
+          description: Mirroring template created.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /mirroring/{system_id}:
+    parameters:
+      - name: system_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getMirroringTemplate
+      summary: Get a mirroring template
+      tags: [mirroring]
+      x-ufm-upstream: GET /ufmRest/app/mirrorings/{system_id}
+      responses:
+        "200":
+          description: Mirroring template details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MirroringTemplate"
+        default:
+          $ref: "#/components/responses/Error"
+
+    put:
+      operationId: updateMirroringTemplate
+      summary: Update a mirroring template
+      tags: [mirroring]
+      x-ufm-upstream: PUT /ufmRest/app/mirrorings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MirroringTemplate"
+      responses:
+        "200":
+          description: Template updated.
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteMirroringTemplate
+      summary: Delete a mirroring template
+      tags: [mirroring]
+      x-ufm-upstream: DELETE /ufmRest/app/mirrorings/{system_id}
+      responses:
+        "200":
+          description: Template deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /mirroring/actions:
+    post:
+      operationId: executeMirroringAction
+      summary: Enable or disable mirroring on a port
+      tags: [mirroring]
+      x-ufm-upstream: POST /ufmRest/app/mirrorings/action
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MirroringAction"
+      responses:
+        "200":
+          description: Mirroring action executed.
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Templates (Provisioning)
+  # =========================================================================
+
+  /templates:
+    get:
+      operationId: listTemplates
+      summary: List provisioning templates
+      tags: [templates]
+      x-ufm-upstream: GET /ufmRest/templates
+      parameters:
+        - name: tags
+          in: query
+          schema:
+            type: string
+        - name: profile
+          in: query
+          schema:
+            type: string
+        - name: system_type
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of templates.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProvisioningTemplate"
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: createTemplate
+      summary: Create a provisioning template
+      tags: [templates]
+      x-ufm-upstream: POST /ufmRest/templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisioningTemplateCreate"
+      responses:
+        "201":
+          description: Template created.
+          headers:
+            Location:
+              schema:
+                type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+  /templates/{template_name}:
+    parameters:
+      - name: template_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getTemplate
+      summary: Get a provisioning template
+      tags: [templates]
+      x-ufm-upstream: GET /ufmRest/templates/{template_name}
+      responses:
+        "200":
+          description: Template with content.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisioningTemplate"
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteTemplate
+      summary: Delete a provisioning template
+      tags: [templates]
+      x-ufm-upstream: DELETE /ufmRest/templates/{template_id}
+      responses:
+        "204":
+          description: Template deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /templates/refresh:
+    post:
+      operationId: refreshTemplates
+      summary: Refresh the templates list
+      tags: [templates]
+      x-ufm-upstream: POST /ufmRest/templates/refresh
+      responses:
+        "200":
+          description: Templates refreshed.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /templates/{template_name}/execute:
+    parameters:
+      - name: template_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: executeTemplate
+      summary: Execute a provisioning template on systems
+      tags: [templates]
+      x-ufm-upstream: POST /ufmRest/actions/provisioning/{template_name}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [system_ids]
+              properties:
+                system_ids:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "202":
+          description: Template execution initiated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Fabric Health
+  # =========================================================================
+
+  /fabric-validations:
+    get:
+      operationId: listFabricValidationTests
+      summary: List available fabric validation tests
+      tags: [fabric-health]
+      x-ufm-upstream: GET /ufmRest/fabricValidation/tests
+      responses:
+        "200":
+          description: List of available tests.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                example:
+                  - CheckLids
+                  - CheckLinks
+                  - CheckSubnetManager
+                  - CheckDuplicateNodes
+                  - CheckDuplicateGuids
+                  - CheckRouting
+                  - CheckLinkSpeed
+                  - CheckLinkWidth
+                  - CheckPartitionKey
+                  - CheckTemperature
+                  - CheckCables
+                  - CheckSymbolBER
+                  - RailOptimizedTopologyValidation
+                  - TreeTopologyValidation
+                  - SocketDirectModeReporting
+                  - ValidateSMConfiguration
+                  - ValidateNodesFirmwareVersion
+                  - ValidateSwitchesCPLDVersion
+        default:
+          $ref: "#/components/responses/Error"
+
+  /fabric-validations/{test_name}:
+    parameters:
+      - name: test_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    post:
+      operationId: runFabricValidationTest
+      summary: Run a fabric validation test
+      tags: [fabric-health]
+      x-ufm-upstream: POST /ufmRest/fabricValidation/tests/{test_name}
+      responses:
+        "202":
+          description: Test started. Returns job for tracking.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+          headers:
+            Location:
+              description: URI of the job tracking the test.
+              schema:
+                type: string
+        "409":
+          description: Test already running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /reports:
+    post:
+      operationId: createReport
+      summary: Create a fabric or UFM health report
+      tags: [fabric-health]
+      x-ufm-upstream: POST /ufmRest/reports/{report_type}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportCreate"
+      responses:
+        "202":
+          description: Report generation started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /reports/{report_id}:
+    parameters:
+      - name: report_id
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      operationId: getReport
+      summary: Get a report
+      tags: [fabric-health]
+      x-ufm-upstream: GET /ufmRest/reports/{report_id}
+      responses:
+        "200":
+          description: Report data.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+    delete:
+      operationId: deleteReport
+      summary: Delete a report
+      tags: [fabric-health]
+      x-ufm-upstream: DELETE /ufmRest/reports/{report_id}
+      responses:
+        "204":
+          description: Report deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /reports/latest/{report_type}:
+    parameters:
+      - name: report_type
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [Fabric_Health, UFM_Health, Topology_Compare]
+
+    get:
+      operationId: getLatestReport
+      summary: Get the latest report of a given type
+      tags: [fabric-health]
+      x-ufm-upstream: GET /ufmRest/reports/last_report/{report_type}
+      responses:
+        "200":
+          description: Latest report data.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Cable Images
+  # =========================================================================
+
+  /cable-images:
+    get:
+      operationId: listCableImages
+      summary: List available cable transceiver images
+      tags: [actions]
+      x-ufm-upstream: GET /ufmRest/app/images/cables
+      responses:
+        "200":
+          description: List of cable images.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+        default:
+          $ref: "#/components/responses/Error"
+
+    post:
+      operationId: uploadCableImage
+      summary: Upload a cable transceiver image
+      tags: [actions]
+      x-ufm-upstream: POST /ufmRest/app/images/cables
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Image uploaded.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /cable-images/{image_name}:
+    parameters:
+      - name: image_name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    delete:
+      operationId: deleteCableImage
+      summary: Delete a cable transceiver image
+      tags: [actions]
+      x-ufm-upstream: DELETE /ufmRest/app/images/cables/{image_name}
+      responses:
+        "204":
+          description: Image deleted.
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Discovery
+  # =========================================================================
+
+  /discovery/inventory:
+    get:
+      operationId: getInventorySummary
+      summary: Get fabric inventory summary
+      tags: [discovery]
+      x-ufm-upstream: GET /ufmRest/monitoring/inventory
+      parameters:
+        - name: include_ports
+          in: query
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Inventory summary.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  /discovery/inventory/count:
+    get:
+      operationId: getInventoryCount
+      summary: Get inventory component counts
+      tags: [discovery]
+      x-ufm-upstream: GET /ufmRest/monitoring/inventory/count
+      responses:
+        "200":
+          description: Component counts.
+          content:
+            application/json:
+              schema:
+                type: object
+        default:
+          $ref: "#/components/responses/Error"
+
+  /discovery/refresh:
+    post:
+      operationId: refreshFabricDiscovery
+      summary: Trigger fabric discovery refresh
+      description: Run after changing node descriptions to notify OpenSM.
+      tags: [discovery]
+      x-ufm-upstream: POST /ufmRest/actions/fabric_discovery_refresh
+      responses:
+        "202":
+          description: Discovery refresh initiated.
+        default:
+          $ref: "#/components/responses/Error"
+
+  # =========================================================================
+  # Config
+  # =========================================================================
+
+  /config:
+    get:
+      operationId: getConfig
+      summary: Get UFM configuration
+      tags: [config]
+      x-ufm-upstream: GET /ufmRest/app/ufm_config
+      responses:
+        "200":
+          description: UFM configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UFMConfig"
+        default:
+          $ref: "#/components/responses/Error"
+
+    patch:
+      operationId: updateConfig
+      summary: Update UFM configuration
+      description: |
+        Partial update of UFM configuration. Not all sections and
+        properties can be modified.
+      tags: [config]
+      x-ufm-upstream: PUT /ufmRest/app/ufm_config
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Configuration updated.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /config/dump-storage:
+    put:
+      operationId: configureDumpStorage
+      summary: Configure external storage for system dumps
+      tags: [config]
+      x-ufm-upstream: PUT /ufmRest/app/profile/system_dump
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                storage_path:
+                  type: string
+      responses:
+        "200":
+          description: Storage configured.
+        default:
+          $ref: "#/components/responses/Error"
+
+  /version:
+    get:
+      operationId: getVersion
+      summary: Get UFM version information
+      tags: [config]
+      x-ufm-upstream: GET /ufmRest/app/ufm_version
+      responses:
+        "200":
+          description: Version information.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UFMVersion"
+        default:
+          $ref: "#/components/responses/Error"
+
+  /tokens:
+    post:
+      operationId: createToken
+      summary: Generate an API access token
+      description: |
+        Authenticates with username/password and returns a reusable
+        access token for subsequent API calls.
+      tags: [config]
+      x-ufm-upstream: POST /ufmRest/app/tokens
+      security:
+        - basicAuth: []
+      responses:
+        "200":
+          description: Access token generated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+        default:
+          $ref: "#/components/responses/Error"
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Token obtained from POST /tokens.
+    basicAuth:
+      type: http
+      scheme: basic
+      description: UFM username and password (or LDAP credentials).
+
+  parameters:
+    cursor:
+      name: cursor
+      in: query
+      description: Pagination cursor from a previous response.
+      schema:
+        type: string
+    limit:
+      name: limit
+      in: query
+      description: Maximum number of items to return (default 100, max 1000).
+      schema:
+        type: integer
+        default: 100
+        minimum: 1
+        maximum: 1000
+    pkey:
+      name: pkey
+      in: path
+      required: true
+      description: "Partition key in hex format (e.g. `0x8001`)."
+      schema:
+        type: string
+        pattern: "^0x[0-9a-fA-F]{1,4}$"
+
+  responses:
+    Error:
+      description: Unexpected error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    # -- Error envelope ------------------------------------------------
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code.
+              example: "partition_not_found"
+            message:
+              type: string
+              description: Human-readable error description.
+              example: "Partition 0x8001 does not exist."
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                  reason:
+                    type: string
+
+    # -- Pagination envelope -------------------------------------------
+    PageInfo:
+      type: object
+      properties:
+        next_cursor:
+          type: string
+          nullable: true
+          description: Cursor for next page, null if last page.
+        total:
+          type: integer
+          description: Total number of items (if known).
+
+    # -- Partitions ----------------------------------------------------
+    Partition:
+      type: object
+      properties:
+        pkey:
+          type: string
+          description: "Partition key in hex (e.g. `0x8001`)."
+          example: "0x8001"
+        name:
+          type: string
+          example: "tenant-gpu-cluster"
+        ip_over_ib:
+          type: boolean
+        index0:
+          type: boolean
+        sharp_enabled:
+          type: boolean
+        qos:
+          $ref: "#/components/schemas/PartitionQoS"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionMember"
+          description: Present only when `include=members`.
+
+    PartitionCreate:
+      type: object
+      required: [pkey]
+      properties:
+        pkey:
+          type: string
+          pattern: "^0x[0-9a-fA-F]{1,4}$"
+          example: "0x12"
+        name:
+          type: string
+          example: "tenant-alpha"
+        ip_over_ib:
+          type: boolean
+          default: true
+        index0:
+          type: boolean
+          default: false
+        qos:
+          $ref: "#/components/schemas/PartitionQoS"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionMemberInput"
+          description: |
+            Optional initial GUID members. If omitted, an empty
+            partition is created.
+
+    PartitionReplace:
+      type: object
+      required: [members]
+      properties:
+        name:
+          type: string
+        ip_over_ib:
+          type: boolean
+        index0:
+          type: boolean
+        qos:
+          $ref: "#/components/schemas/PartitionQoS"
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionMemberInput"
+
+    PartitionQoS:
+      type: object
+      properties:
+        mtu_limit:
+          type: integer
+          enum: [2, 4]
+          default: 2
+          description: "MTU limit: 2 = 2048, 4 = 4096."
+        service_level:
+          type: integer
+          minimum: 0
+          maximum: 15
+          default: 0
+        rate_limit:
+          type: number
+          default: 2.5
+          description: Rate limit (predefined values).
+
+    PartitionMember:
+      type: object
+      properties:
+        guid:
+          type: string
+          example: "98039b0300860ace"
+        membership:
+          type: string
+          enum: [full, limited]
+        index0:
+          type: boolean
+
+    PartitionMemberInput:
+      type: object
+      required: [guid]
+      properties:
+        guid:
+          type: string
+          example: "98039b0300860ace"
+        membership:
+          type: string
+          enum: [full, limited]
+          default: full
+
+    PartitionMembersAdd:
+      type: object
+      required: [members]
+      properties:
+        members:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionMemberInput"
+        ip_over_ib:
+          type: boolean
+          default: true
+        index0:
+          type: boolean
+          default: false
+
+    PartitionHostsAdd:
+      type: object
+      required: [hosts]
+      properties:
+        hosts:
+          type: array
+          items:
+            type: string
+          description: Hostnames to add.
+          example: ["r-ufm51", "r-ufm77"]
+        membership:
+          type: string
+          enum: [full, limited]
+          default: full
+        ip_over_ib:
+          type: boolean
+          default: true
+        index0:
+          type: boolean
+          default: false
+
+    PartitionList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Partition"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    PartitionMemberList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/PartitionMember"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    # -- Systems -------------------------------------------------------
+    System:
+      type: object
+      properties:
+        guid:
+          type: string
+        name:
+          type: string
+        ip:
+          type: string
+        type:
+          type: string
+          enum: [switch, host, gateway, router]
+        model:
+          type: string
+        role:
+          type: string
+          enum: [core, tor, endpoint]
+        vendor:
+          type: string
+        firmware_version:
+          type: string
+        description:
+          type: string
+        ports:
+          type: array
+          items:
+            $ref: "#/components/schemas/Port"
+          description: Present only when `include=ports`.
+
+    SystemUpdate:
+      type: object
+      properties:
+        ip:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+        script:
+          type: string
+
+    SystemPower:
+      type: object
+      properties:
+        system_id:
+          type: string
+        power_watts:
+          type: number
+
+    SystemList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/System"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    # -- Ports ---------------------------------------------------------
+    Port:
+      type: object
+      properties:
+        name:
+          type: string
+        guid:
+          type: string
+        system_name:
+          type: string
+        system_guid:
+          type: string
+        physical_port_number:
+          type: integer
+        logical_port_state:
+          type: string
+        physical_port_state:
+          type: string
+        speed:
+          type: string
+        width:
+          type: string
+        external:
+          type: boolean
+        cable_info:
+          type: object
+          description: Present only when `include=cable_info`.
+
+    VirtualPort:
+      type: object
+      properties:
+        virtual_port_guid:
+          type: string
+        virtual_port_state:
+          type: string
+        virtual_port_lid:
+          type: integer
+        system_guid:
+          type: string
+        system_name:
+          type: string
+        system_ip:
+          type: string
+        port_guid:
+          type: string
+        port_name:
+          type: string
+        physical_port_number:
+          type: integer
+
+    PortList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Port"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    VirtualPortList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/VirtualPort"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    # -- Links ---------------------------------------------------------
+    Link:
+      type: object
+      properties:
+        source_port:
+          type: string
+        destination_port:
+          type: string
+        speed:
+          type: string
+        width:
+          type: string
+
+    LinkList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Link"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    # -- Jobs ----------------------------------------------------------
+    Job:
+      type: object
+      properties:
+        id:
+          type: string
+        operation:
+          type: string
+        status:
+          type: string
+          enum: [running, completed, failed, aborted]
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        sub_jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+          description: Present only when `include=sub_jobs`.
+
+    JobList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    # -- Monitoring ----------------------------------------------------
+    MonitoringSessionCreate:
+      type: object
+      properties:
+        interval:
+          type: integer
+          description: Collection interval in seconds.
+        attributes:
+          type: array
+          items:
+            type: string
+        members:
+          type: array
+          items:
+            type: string
+
+    MonitoringSession:
+      type: object
+      properties:
+        id:
+          type: string
+        interval:
+          type: integer
+        attributes:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+
+    MonitoringSnapshotCreate:
+      type: object
+      properties:
+        attributes:
+          type: array
+          items:
+            type: string
+        members:
+          type: array
+          items:
+            type: string
+
+    MonitoringTemplate:
+      type: object
+      properties:
+        name:
+          type: string
+        interval:
+          type: integer
+        attributes:
+          type: array
+          items:
+            type: string
+
+    # -- Topology (Logical Model) --------------------------------------
+    Environment:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+
+    EnvironmentCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+
+    EnvironmentList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Environment"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    LogicalServer:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        computes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Compute"
+
+    LogicalServerCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+
+    Compute:
+      type: object
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum: [allocated, free]
+
+    Network:
+      type: object
+      properties:
+        name:
+          type: string
+        pkey:
+          type: string
+        ip_over_ib:
+          type: boolean
+
+    NetworkCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        pkey:
+          type: string
+        ip_over_ib:
+          type: boolean
+
+    # -- Mirroring -----------------------------------------------------
+    MirroringTemplate:
+      type: object
+      properties:
+        system_id:
+          type: string
+        target_port:
+          type: string
+        packet_size:
+          type: integer
+        service_level:
+          type: integer
+
+    MirroringAction:
+      type: object
+      required: [port_id, action]
+      properties:
+        port_id:
+          type: string
+        action:
+          type: string
+          enum: [enable, disable]
+        rx:
+          type: boolean
+          default: true
+        tx:
+          type: boolean
+          default: true
+
+    # -- Templates (Provisioning) --------------------------------------
+    ProvisioningTemplate:
+      type: object
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        system_type:
+          type: string
+        owner:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        content:
+          type: array
+          items:
+            type: object
+          description: Template command sequence.
+
+    ProvisioningTemplateCreate:
+      type: object
+      required: [title, system_type, content]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        system_type:
+          type: string
+        content:
+          type: array
+          items:
+            type: object
+
+    # -- Reports -------------------------------------------------------
+    ReportCreate:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [Fabric_Health, UFM_Health, Topology_Compare]
+        parameters:
+          type: object
+          additionalProperties: true
+          description: Report-specific configuration parameters.
+
+    # -- Config --------------------------------------------------------
+    UFMConfig:
+      type: object
+      properties:
+        default_session_interval:
+          type: integer
+        disabled_features:
+          type: array
+          items:
+            type: string
+        ha_mode:
+          type: string
+        is_local_user:
+          type: boolean
+        site_name:
+          type: string
+
+    UFMVersion:
+      type: object
+      properties:
+        ufm_release_version:
+          type: string
+        opensm_version:
+          type: string
+        sharp_version:
+          type: string
+        ibdiagnet_version:
+          type: string
+        telemetry_version:
+          type: string
+        mft_version:
+          type: string
+        webui_version:
+          type: string
+        plugins:
+          type: object
+          additionalProperties:
+            type: string
